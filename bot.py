@@ -4,13 +4,19 @@ import html
 import requests
 from playwright.sync_api import sync_playwright
 from deep_translator import GoogleTranslator
+import fitz  # PyMuPDF to convert PDF to the official map poster image
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SEEN_FILE = "seen_ids.json"
-UKMTO_URL = "https://www.ukmto.org/recent-incidents"
 
-# Channel Footer
+UKMTO_URLS = [
+    "https://www.ukmto.org/ukmto-products/warnings",
+    "https://www.ukmto.org/ukmto-products/advisories",
+    "https://www.ukmto.org/recent-incidents"
+]
+
+# Required Channel Footer
 FOOTER = """🌊 @secretollah
 #حادثه_دریایی
 #مرکز_تجارت_دریایی_بریتانیا"""
@@ -29,97 +35,127 @@ def save_seen_ids(seen_ids):
         json.dump(seen_ids[-100:], f, indent=2)
 
 def translate_to_persian(text):
-    """Translates summary into Persian."""
+    """Translates summary to Persian."""
     try:
-        translated = GoogleTranslator(source='auto', target='fa').translate(text[:400])
+        translated = GoogleTranslator(source='auto', target='fa').translate(text[:450])
         return translated
     except Exception as e:
         print(f"Translation error: {e}")
-        return text[:400]
+        return text[:450]
 
-def scrape_ukmto_report_cards():
+def render_pdf_poster(pdf_bytes, output_image_path):
     """
-    Finds all UKMTO report cards on the webpage and takes 
-    an element screenshot of each card.
+    Renders Page 1 of the official UKMTO PDF at 200 DPI resolution.
+    Produces the exact official poster with satellite map, markers, and header.
+    """
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        if len(doc) > 0:
+            page = doc[0]
+            
+            # Render at high-definition 200 DPI
+            zoom = 200 / 72
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            pix.save(output_image_path)
+            
+            extracted_text = page.get_text()
+            return output_image_path, extracted_text
+    except Exception as e:
+        print(f"Error rendering PDF poster: {e}")
+    return None, ""
+
+def scrape_and_render_ukmto_posters():
+    """
+    Finds UKMTO PDF downloads, converts them into full map posters,
+    and returns report items ready for Telegram.
     """
     reports = []
     
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
+            accept_downloads=True,
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 1000}
+            viewport={"width": 1400, "height": 900}
         )
         page = context.new_page()
 
-        print(f"Opening UKMTO recent incidents page...")
-        page.goto(UKMTO_URL, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(5000)
-
-        # Accept cookies
-        try:
-            cookie_btn = page.query_selector("button:has-text('Accept'), .cookie-accept")
-            if cookie_btn:
-                cookie_btn.click()
-                page.wait_for_timeout(1000)
-        except Exception:
-            pass
-
-        # Query all elements on page
-        all_elements = page.query_selector_all("div, tr, article, li")
-        
-        found_keys = set()
-        count = 0
-
-        for elem in all_elements:
+        for page_url in UKMTO_URLS:
             try:
-                text = elem.inner_text().strip()
-                
-                # Target UKMTO report card elements
-                if "UKMTO" in text and ("ADVISORY" in text or "WARNING" in text or "ATTACK" in text or "HIJACK" in text):
-                    # Filter for element length of a report card
-                    if 60 < len(text) < 1200:
-                        
-                        # Generate unique ID from the report text
-                        first_line = text.split("\n")[0] if "\n" in text else text[:60]
-                        report_key = f"ukmto_{hash(first_line)}"
-                        
-                        if report_key in found_keys:
-                            continue
-                        found_keys.add(report_key)
+                print(f"Connecting to UKMTO: {page_url}")
+                page.goto(page_url, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(4000)
 
-                        photo_filename = f"card_photo_{count}.png"
-                        
-                        # Screenshot the exact report card element on screen
-                        try:
-                            elem.screenshot(path=photo_filename)
-                        except Exception:
-                            page.screenshot(path=photo_filename, full_page=False)
+                # Accept cookie prompt if present
+                try:
+                    cookie_btn = page.query_selector("button:has-text('Accept'), .cookie-accept")
+                    if cookie_btn:
+                        cookie_btn.click()
+                        page.wait_for_timeout(1000)
+                except Exception:
+                    pass
 
-                        reports.append({
-                            "id": first_line,
-                            "text": text,
-                            "photo_path": photo_filename,
-                            "link": UKMTO_URL
-                        })
-                        count += 1
-                        
-                        if count >= 15:
-                            break
+                # Select active month tabs (August, July, etc.)
+                tabs = page.query_selector_all("li, button, div, span")
+                for tab in tabs:
+                    try:
+                        tab_text = tab.inner_text().strip()
+                        if any(m in tab_text for m in ["August", "July", "June", "May"]) and "(" in tab_text and ")" in tab_text:
+                            if "(0)" not in tab_text:
+                                tab.click(timeout=1500)
+                                page.wait_for_timeout(1500)
+                    except Exception:
+                        pass
 
-            except Exception:
-                continue
+                # Intercept download buttons (the download arrow icons)
+                download_btns = page.query_selector_all("button, svg, i, a, [class*='download']")
+                print(f"Found {len(download_btns)} download triggers on {page_url}")
+
+                download_count = 0
+                for btn in download_btns:
+                    try:
+                        with page.expect_download(timeout=2500) as download_info:
+                            btn.click(timeout=1000)
+
+                        download = download_info.value
+                        filename = download.suggested_filename or f"ukmto_report_{download_count}.pdf"
+                        
+                        # Read PDF stream into memory
+                        pdf_path = download.path()
+                        with open(pdf_path, "rb") as f:
+                            pdf_bytes = f.read()
+
+                        poster_png = f"poster_{len(reports)}.png"
+                        
+                        # Render the PDF into the official Map Poster Image
+                        photo_file, extracted_text = render_pdf_poster(pdf_bytes, poster_png)
+
+                        if photo_file and len(extracted_text) > 15:
+                            reports.append({
+                                "id": filename,
+                                "text": extracted_text.strip(),
+                                "photo_path": photo_file,
+                                "link": page_url
+                            })
+                            download_count += 1
+
+                    except Exception:
+                        continue
+
+            except Exception as e:
+                print(f"Error reading {page_url}: {e}")
 
         browser.close()
 
     return reports
 
 def send_telegram_photo(photo_path, caption):
-    """Sends report photo with Persian translation & spoiler formatting to Telegram."""
+    """Sends the official map poster photo to Telegram."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
     data = {
         "chat_id": CHAT_ID,
-        "caption": caption[:1024],
+        "caption": caption[:1024],  # Telegram max caption limit
         "parse_mode": "HTML"
     }
 
@@ -132,36 +168,37 @@ def send_telegram_photo(photo_path, caption):
 
 def main():
     seen_ids = load_seen_ids()
-    reports = scrape_ukmto_report_cards()
+    reports = scrape_and_render_ukmto_posters()
 
     if not reports:
-        print("No report cards found on UKMTO page.")
+        print("No new PDF posters rendered.")
         return
 
-    print(f"Found {len(reports)} report cards on page!")
+    print(f"Successfully created {len(reports)} official UKMTO Map Posters!")
 
-    # Process from oldest to newest
+    # Post from oldest to newest
     for item in reversed(reports):
         item_id = item["id"]
 
         if item_id in seen_ids:
-            print(f"Skipping previously posted report: {item_id}")
+            print(f"Skipping already posted poster: {item_id}")
             continue
 
         raw_text = item["text"]
         link = item["link"]
         photo_path = item["photo_path"]
 
-        # Clean text formatting
+        # Clean text
         clean_text = " ".join(raw_text.split())
 
         # Translate summary to Persian
         persian_translation = translate_to_persian(clean_text)
 
-        # HTML escape
+        # HTML Escape
         safe_persian = html.escape(persian_translation[:350])
         safe_original = html.escape(clean_text[:350])
 
+        # Caption
         caption = (
             f"🚨 <b>گزارش حادثه مرکز تجارت دریایی بریتانیا (UKMTO)</b>\n\n"
             f"{safe_persian}\n\n"
@@ -170,11 +207,11 @@ def main():
             f"{FOOTER}"
         )
 
-        print(f"Posting report card photo to Telegram: {item_id}")
+        print(f"Posting official Map Poster photo to Telegram for {item_id}...")
         success = send_telegram_photo(photo_path, caption)
 
         if success:
-            print("Successfully posted report photo to Telegram!")
+            print("Posted official UKMTO Map Poster to Telegram successfully!")
             seen_ids.append(item_id)
         else:
             print("Failed to post photo to Telegram.")

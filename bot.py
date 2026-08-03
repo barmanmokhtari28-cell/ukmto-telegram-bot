@@ -10,10 +10,9 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SEEN_FILE = "seen_ids.json"
 
-UKMTO_URLS = [
+URLS_TO_SCRAPE = [
     "https://www.ukmto.org/ukmto-products/warnings",
-    "https://www.ukmto.org/ukmto-products/advisories",
-    "https://www.ukmto.org/recent-incidents"
+    "https://www.ukmto.org/ukmto-products/advisories"
 ]
 
 # Required Channel Footer
@@ -45,8 +44,8 @@ def translate_to_persian(text):
 
 def render_pdf_bytes_to_png(pdf_bytes, output_png_path):
     """
-    Renders Page 1 of PDF bytes at 200 DPI resolution.
-    Produces the official poster with satellite map, markers, and header.
+    Renders Page 1 of the official UKMTO PDF at 200 DPI resolution.
+    Produces the exact official poster with satellite map, markers, and header.
     """
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -59,16 +58,16 @@ def render_pdf_bytes_to_png(pdf_bytes, output_png_path):
             extracted_text = page.get_text()
             return output_png_path, extracted_text
     except Exception as e:
-        print(f"Error rendering PDF bytes to image: {e}")
+        print(f"Error rendering PDF bytes: {e}")
     return None, ""
 
-def scrape_ukmto_posters():
+def scrape_ukmto_pdf_urls():
     """
-    Scrapes UKMTO pages, extracts direct PDF URLs, downloads PDFs,
-    and converts them into full map posters.
+    Navigates UKMTO pages, clicks '2026', clicks 'August' (and active months),
+    and extracts all direct /-/media/...pdf links.
     """
-    reports = []
-    
+    pdf_urls = set()
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -77,11 +76,11 @@ def scrape_ukmto_posters():
         )
         page = context.new_page()
 
-        for page_url in UKMTO_URLS:
+        for page_url in URLS_TO_SCRAPE:
             try:
-                print(f"Connecting to UKMTO: {page_url}")
+                print(f"Navigating to UKMTO page: {page_url}")
                 page.goto(page_url, wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(4000)
+                page.wait_for_timeout(3000)
 
                 # Accept cookies
                 try:
@@ -92,93 +91,68 @@ def scrape_ukmto_posters():
                 except Exception:
                     pass
 
-                # Select active month tab if present
-                tabs = page.query_selector_all("li, button, div, span")
-                for tab in tabs:
-                    try:
-                        tab_text = tab.inner_text().strip()
-                        if any(m in tab_text for m in ["August", "July", "June"]) and "(" in tab_text and ")" in tab_text:
-                            if "(0)" not in tab_text:
-                                tab.click(timeout=1500)
-                                page.wait_for_timeout(1500)
-                    except Exception:
-                        pass
+                # Step 1: Click the '2026' card
+                print("Clicking '2026' year product card...")
+                year_card = page.query_selector("text='2026', :has-text('2026')")
+                if year_card:
+                    year_card.click()
+                    page.wait_for_timeout(2500)
 
-                # Extract all direct PDF links / attributes from the page DOM
-                pdf_urls = page.evaluate("""
+                # Step 2: Click 'August' (or latest month tab)
+                print("Clicking 'August' month tab...")
+                month_tab = page.query_selector("text='August', :has-text('August')")
+                if month_tab:
+                    month_tab.click()
+                    page.wait_for_timeout(2000)
+
+                # Step 3: Extract all direct /-/media/...pdf links from DOM
+                found_links = page.evaluate("""
                     () => {
-                        const urls = [];
-                        document.querySelectorAll('a, button, [data-url], [data-href], [onclick]').forEach(el => {
-                            const link = el.href || el.getAttribute('data-url') || el.getAttribute('data-href') || el.getAttribute('onclick') || '';
-                            if (link && (link.includes('.pdf') || link.includes('media') || link.includes('download') || link.includes('Warning') || link.includes('Advisory'))) {
-                                urls.push(link);
+                        const pdfs = [];
+                        document.querySelectorAll('a').forEach(a => {
+                            const href = a.href;
+                            if (href && (href.includes('/-/media/') || href.includes('.pdf'))) {
+                                pdfs.push(href);
                             }
                         });
-                        return urls;
+                        return pdfs;
                     }
                 """)
 
-                print(f"Found {len(pdf_urls)} potential PDF links in DOM on {page_url}")
-
-                # Download PDF files and render posters
-                for idx, pdf_url in enumerate(pdf_urls[:10]):
-                    try:
-                        if not pdf_url.startswith("http"):
-                            if pdf_url.startswith("/"):
-                                pdf_url = "https://www.ukmto.org" + pdf_url
-                            else:
-                                continue
-
-                        print(f"Downloading PDF file directly: {pdf_url}")
-                        res = requests.get(pdf_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
-
-                        if res.status_code == 200 and len(res.content) > 1000 and b"%PDF" in res.content[:10]:
-                            img_path = f"poster_pdf_{len(reports)}.png"
-                            photo_file, text = render_pdf_bytes_to_png(res.content, img_path)
-
-                            if photo_file and len(text) > 10:
-                                reports.append({
-                                    "id": pdf_url,
-                                    "text": text,
-                                    "photo_path": photo_file,
-                                    "link": page_url
-                                })
-                    except Exception as err:
-                        print(f"Error fetching PDF {pdf_url}: {err}")
-
-                # Fallback: Click preview/eye icon to capture poster preview modal if direct link fails
-                if len(reports) == 0:
-                    eye_icons = page.query_selector_all("i, svg, button, .fa-eye, [class*='eye'], div.card")
-                    print(f"Testing {len(eye_icons)} preview icons...")
-                    for idx, icon in enumerate(eye_icons[:5]):
-                        try:
-                            icon.click(timeout=1500)
-                            page.wait_for_timeout(2000)
-
-                            modal = page.query_selector(".modal, .popup, .pdf-viewer, div[role='dialog'], iframe")
-                            img_path = f"poster_preview_{len(reports)}.png"
-
-                            if modal:
-                                modal.screenshot(path=img_path)
-                            else:
-                                page.screenshot(path=img_path, full_page=False)
-
-                            text = page.evaluate("() => document.body.innerText")
-
-                            reports.append({
-                                "id": f"preview_{idx}_{hash(text[:50])}",
-                                "text": text[:500],
-                                "photo_path": img_path,
-                                "link": page_url
-                            })
-                            break
-                        except Exception:
-                            continue
+                print(f"Extracted {len(found_links)} direct PDF URLs from {page_url}!")
+                for link in found_links:
+                    pdf_urls.add(link)
 
             except Exception as e:
-                print(f"Error processing page {page_url}: {e}")
+                print(f"Error navigating {page_url}: {e}")
 
         browser.close()
+
+    return list(pdf_urls)
+
+def download_and_render_reports(pdf_urls):
+    """Downloads PDFs directly and renders the 1-page map posters."""
+    reports = []
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+    for idx, pdf_url in enumerate(pdf_urls[:15]):
+        try:
+            print(f"Downloading PDF report: {pdf_url}")
+            res = requests.get(pdf_url, headers=headers, timeout=25)
+
+            if res.status_code == 200 and len(res.content) > 1000 and b"%PDF" in res.content[:10]:
+                png_path = f"poster_{idx}.png"
+                photo_file, extracted_text = render_pdf_bytes_to_png(res.content, png_path)
+
+                if photo_file and len(extracted_text) > 15:
+                    reports.append({
+                        "id": pdf_url,
+                        "text": extracted_text.strip(),
+                        "photo_path": photo_file,
+                        "link": pdf_url
+                    })
+        except Exception as e:
+            print(f"Error downloading PDF {pdf_url}: {e}")
 
     return reports
 
@@ -200,19 +174,20 @@ def send_telegram_photo(photo_path, caption):
 
 def main():
     seen_ids = load_seen_ids()
-    reports = scrape_ukmto_posters()
+    pdf_urls = scrape_ukmto_pdf_urls()
 
-    if not reports:
-        print("No UKMTO poster reports generated.")
+    if not pdf_urls:
+        print("No direct PDF URLs extracted.")
         return
 
-    print(f"Successfully generated {len(reports)} UKMTO map posters!")
+    print(f"Collected {len(pdf_urls)} direct UKMTO PDF links!")
+    reports = download_and_render_reports(pdf_urls)
 
     for item in reversed(reports):
         item_id = item["id"]
 
         if item_id in seen_ids:
-            print(f"Skipping already posted: {item_id}")
+            print(f"Skipping already posted PDF: {item_id}")
             continue
 
         raw_text = item["text"]
@@ -232,11 +207,11 @@ def main():
             f"🚨 <b>گزارش حادثه مرکز تجارت دریایی بریتانیا (UKMTO)</b>\n\n"
             f"{safe_persian}\n\n"
             f"<tg-spoiler>{safe_original}</tg-spoiler>\n\n"
-            f"🔗 <a href='{link}'>منبع گزارش رسمی</a>\n\n"
+            f"🔗 <a href='{link}'>دانلود PDF گزارش رسمی</a>\n\n"
             f"{FOOTER}"
         )
 
-        print(f"Posting official Map Poster photo to Telegram: {item_id}")
+        print(f"Posting official Map Poster photo to Telegram for {item_id}...")
         success = send_telegram_photo(photo_path, caption)
 
         if success:

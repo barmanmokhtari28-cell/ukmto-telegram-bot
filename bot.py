@@ -4,7 +4,7 @@ import html
 import requests
 from playwright.sync_api import sync_playwright
 from deep_translator import GoogleTranslator
-import fitz  # PyMuPDF to convert PDF into the official map poster image
+import fitz  # PyMuPDF to convert PDF to the official map poster image
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -61,34 +61,19 @@ def render_pdf_bytes_to_png(pdf_bytes, output_png_path):
         print(f"Error rendering PDF bytes: {e}")
     return None, ""
 
-def scrape_and_download_posters():
-    reports = []
-    captured_pdfs = {}
+def scrape_ukmto_pdf_urls():
+    """
+    Clicks 2026 -> Clicks August -> Scrapes all direct /-/media/...pdf href links.
+    """
+    pdf_urls = set()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
-            accept_downloads=True,
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             viewport={"width": 1400, "height": 1000}
         )
         page = context.new_page()
-
-        # Network interceptor to automatically capture any PDF file downloaded from UKMTO
-        def handle_response(response):
-            try:
-                url = response.url
-                if ("/-/media/" in url or ".pdf" in url.lower()) and response.status == 200:
-                    content_type = response.headers.get("content-type", "")
-                    if "pdf" in content_type.lower() or url.endswith(".pdf") or "download=true" in url:
-                        body = response.body()
-                        if len(body) > 1000 and b"%PDF" in body[:10]:
-                            captured_pdfs[url] = body
-                            print(f"Intercepted PDF file URL: {url}")
-            except Exception:
-                pass
-
-        page.on("response", handle_response)
 
         for page_url in UKMTO_URLS:
             try:
@@ -96,7 +81,7 @@ def scrape_and_download_posters():
                 page.goto(page_url, wait_until="domcontentloaded", timeout=60000)
                 page.wait_for_timeout(3000)
 
-                # Accept cookies if banner appears
+                # Accept cookies
                 try:
                     cookie_btn = page.query_selector("button:has-text('Accept'), .cookie-accept")
                     if cookie_btn:
@@ -107,70 +92,77 @@ def scrape_and_download_posters():
 
                 # Step 1: Click "2026" product card
                 print("Clicking '2026' year product card...")
-                year_cards = page.query_selector_all("div, button, a, h3, h2")
+                year_cards = page.query_selector_all("div, button, a, h3, h2, p")
                 for yc in year_cards:
-                    txt = yc.inner_text().strip()
-                    if "2026" in txt and ("Report" in txt or "10" in txt or "2026" == txt):
-                        try:
+                    try:
+                        txt = yc.inner_text().strip()
+                        if "2026" in txt and ("Report" in txt or "10" in txt or txt == "2026"):
                             yc.click(timeout=2000)
                             page.wait_for_timeout(2500)
                             break
-                        except Exception:
-                            pass
+                    except Exception:
+                        pass
 
                 # Step 2: Click "August" month tab
                 print("Clicking 'August' month tab...")
                 month_tabs = page.query_selector_all("li, button, div, span, a")
                 for mt in month_tabs:
-                    txt = mt.inner_text().strip()
-                    if "August" in txt:
-                        try:
+                    try:
+                        txt = mt.inner_text().strip()
+                        if "August" in txt and "(" in txt and ")" in txt:
                             mt.click(timeout=2000)
                             page.wait_for_timeout(2000)
                             break
-                        except Exception:
-                            pass
-
-                # Step 3: Find download buttons in the loaded August 2026 table
-                download_triggers = page.query_selector_all("svg, i, button, a, [class*='download']")
-                print(f"Found {len(download_triggers)} interactive elements in August 2026 table.")
-
-                for btn in download_triggers:
-                    try:
-                        with page.expect_download(timeout=4000) as download_info:
-                            btn.click(timeout=1000)
-
-                        download = download_info.value
-                        download_url = download.url
-                        pdf_path = download.path()
-
-                        with open(pdf_path, "rb") as f:
-                            captured_pdfs[download_url] = f.read()
-
-                        print(f"Successfully captured PDF via click: {download_url}")
-
                     except Exception:
-                        continue
+                        pass
+
+                # Step 3: Extract all direct <a> href attributes containing /-/media/ or .pdf
+                anchors = page.query_selector_all("a")
+                found_on_page = 0
+                for a in anchors:
+                    try:
+                        href = a.get_attribute("href")
+                        if href and ("/-/media/" in href or ".pdf" in href.lower()):
+                            if href.startswith("/"):
+                                href = "https://www.ukmto.org" + href
+                            pdf_urls.add(href)
+                            found_on_page += 1
+                    except Exception:
+                        pass
+
+                print(f"Extracted {found_on_page} direct PDF URLs from {page_url}!")
 
             except Exception as e:
                 print(f"Error navigating {page_url}: {e}")
 
         browser.close()
 
-    # Convert all captured PDFs to Map Poster Images
-    print(f"Total captured PDF documents: {len(captured_pdfs)}")
+    return list(pdf_urls)
 
-    for idx, (pdf_url, pdf_bytes) in enumerate(captured_pdfs.items()):
-        png_path = f"official_poster_{idx}.png"
-        photo_file, extracted_text = render_pdf_bytes_to_png(pdf_bytes, png_path)
+def download_and_render_reports(pdf_urls):
+    """Downloads PDF files directly and renders Page 1 into map poster PNG photos."""
+    reports = []
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-        if photo_file and len(extracted_text) > 15:
-            reports.append({
-                "id": pdf_url,
-                "text": extracted_text.strip(),
-                "photo_path": photo_file,
-                "link": page_url
-            })
+    for idx, pdf_url in enumerate(pdf_urls):
+        try:
+            print(f"Downloading PDF report: {pdf_url}")
+            res = requests.get(pdf_url, headers=headers, timeout=25)
+
+            if res.status_code == 200 and len(res.content) > 1000 and b"%PDF" in res.content[:10]:
+                png_path = f"poster_{idx}.png"
+                photo_file, extracted_text = render_pdf_bytes_to_png(res.content, png_path)
+
+                if photo_file and len(extracted_text) > 15:
+                    reports.append({
+                        "id": pdf_url,
+                        "text": extracted_text.strip(),
+                        "photo_path": photo_file,
+                        "link": pdf_url
+                    })
+                    print(f"Successfully rendered map poster for: {pdf_url}")
+        except Exception as e:
+            print(f"Error downloading PDF {pdf_url}: {e}")
 
     return reports
 
@@ -192,13 +184,14 @@ def send_telegram_photo(photo_path, caption):
 
 def main():
     seen_ids = load_seen_ids()
-    reports = scrape_and_download_posters()
+    pdf_urls = scrape_ukmto_pdf_urls()
 
-    if not reports:
-        print("No new PDF posters rendered.")
+    if not pdf_urls:
+        print("No direct PDF URLs extracted.")
         return
 
-    print(f"Successfully generated {len(reports)} UKMTO map posters!")
+    print(f"Collected {len(pdf_urls)} direct UKMTO PDF links!")
+    reports = download_and_render_reports(pdf_urls)
 
     for item in reversed(reports):
         item_id = item["id"]
@@ -224,11 +217,11 @@ def main():
             f"🚨 <b>گزارش حادثه مرکز تجارت دریایی بریتانیا (UKMTO)</b>\n\n"
             f"{safe_persian}\n\n"
             f"<tg-spoiler>{safe_original}</tg-spoiler>\n\n"
-            f"🔗 <a href='{link}'>منبع گزارش رسمی</a>\n\n"
+            f"🔗 <a href='{link}'>دانلود PDF گزارش رسمی</a>\n\n"
             f"{FOOTER}"
         )
 
-        print(f"Posting official Map Poster photo to Telegram: {item_id}")
+        print(f"Posting official Map Poster photo to Telegram for {item_id}...")
         success = send_telegram_photo(photo_path, caption)
 
         if success:

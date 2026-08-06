@@ -56,7 +56,6 @@ def translate_to_persian(text, max_retries=3):
 def scrape_ukmto_report_cards():
     reports = []
     
-    # Keywords indicating a UKMTO security report
     keywords = ["ADVISORY", "WARNING", "ATTACK", "HIJACK", "INCIDENT", "BOARDING", "SUSPICIOUS", "FLASH", "NOTICE", "UPDATE"]
 
     with sync_playwright() as p:
@@ -68,10 +67,11 @@ def scrape_ukmto_report_cards():
         page = context.new_page()
 
         print(f"Opening UKMTO recent incidents page...")
-        page.goto(UKMTO_URL, wait_until="networkidle", timeout=60000)
-        page.wait_for_timeout(3000)
+        # Fixed: Changed wait_until to "domcontentloaded" to prevent 60-second timeouts
+        page.goto(UKMTO_URL, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(5000)
 
-        # Accept cookie banner if present
+        # Accept cookies if banner appears
         try:
             cookie_btn = page.query_selector("button:has-text('Accept'), .cookie-accept")
             if cookie_btn:
@@ -80,7 +80,7 @@ def scrape_ukmto_report_cards():
         except Exception:
             pass
 
-        # Scroll page down to force lazy-loaded content to render
+        # Scroll page down and back up to force dynamic cards to render
         page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
         page.wait_for_timeout(1500)
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -88,7 +88,6 @@ def scrape_ukmto_report_cards():
         page.evaluate("window.scrollTo(0, 0)")
         page.wait_for_timeout(1000)
 
-        # Query potential report elements
         all_elements = page.query_selector_all("div, tr, article, li")
         found_signatures = set()
         count = 0
@@ -98,11 +97,10 @@ def scrape_ukmto_report_cards():
                 text = elem.inner_text().strip()
                 upper_text = text.upper()
 
-                # Check if text mentions UKMTO and any incident keyword
                 if "UKMTO" in upper_text and any(kw in upper_text for kw in keywords):
                     if 60 < len(text) < 1500:
                         
-                        # Avoid parent container elements that embed multiple sub-elements
+                        # Filter out parent containers holding multiple report cards
                         sub_matches = elem.query_selector_all("article, div, tr, li")
                         is_parent_container = False
                         for sub in sub_matches:
@@ -114,7 +112,6 @@ def scrape_ukmto_report_cards():
                         if is_parent_container:
                             continue
 
-                        # Create a unique SHA256 signature for the report
                         text_signature = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
                         
                         if text_signature in found_signatures:

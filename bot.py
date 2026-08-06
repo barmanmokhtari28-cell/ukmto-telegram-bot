@@ -67,7 +67,6 @@ def scrape_ukmto_report_cards():
         page = context.new_page()
 
         print(f"Opening UKMTO recent incidents page...")
-        # Fixed: Changed wait_until to "domcontentloaded" to prevent 60-second timeouts
         page.goto(UKMTO_URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(5000)
 
@@ -178,7 +177,6 @@ def main():
             continue
 
         raw_text = item["text"]
-        link = item["link"]
         photo_path = item["photo_path"]
 
         clean_text = " ".join(raw_text.split())
@@ -191,7 +189,6 @@ def main():
             f"🚨 <b>گزارش حادثه مرکز تجارت دریایی بریتانیا (UKMTO)</b>\n\n"
             f"{safe_persian}\n\n"
             f"<tg-spoiler>{safe_original}</tg-spoiler>\n\n"
-            f"🔗 <a href='{link}'>منبع گزارش رسمی</a>\n\n"
             f"{FOOTER}"
         )
 

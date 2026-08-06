@@ -1,6 +1,7 @@
 import os
 import json
 import html
+import time
 import requests
 from playwright.sync_api import sync_playwright
 from deep_translator import GoogleTranslator
@@ -28,14 +29,32 @@ def save_seen_ids(seen_ids):
     with open(SEEN_FILE, "w") as f:
         json.dump(seen_ids[-100:], f, indent=2)
 
-def translate_to_persian(text):
-    """Translates summary into Persian."""
-    try:
-        translated = GoogleTranslator(source='auto', target='fa').translate(text[:400])
-        return translated
-    except Exception as e:
-        print(f"Translation error: {e}")
-        return text[:400]
+def translate_to_persian(text, max_retries=3):
+    """Translates summary into Persian with retry logic and error detection."""
+    if not text:
+        return ""
+
+    input_text = text[:400]
+    error_indicators = ["Error 500", "Server Error", "That’s an error", "That's an error"]
+
+    for attempt in range(max_retries):
+        try:
+            translated = GoogleTranslator(source='auto', target='fa').translate(input_text)
+            
+            # Check if Google returned an error response page instead of a translation
+            if translated and any(indicator in translated for indicator in error_indicators):
+                print(f"[DEBUG] Translation attempt {attempt + 1} returned Google Error page text. Retrying...")
+                time.sleep(2)
+                continue
+
+            if translated:
+                return translated
+        except Exception as e:
+            print(f"[DEBUG] Translation attempt {attempt + 1} error: {e}")
+            time.sleep(2)
+
+    print("[DEBUG] Translation failed after max retries. Using original text as fallback.")
+    return input_text
 
 def scrape_ukmto_report_cards():
     """

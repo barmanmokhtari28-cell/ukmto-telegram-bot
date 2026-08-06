@@ -3,6 +3,7 @@ import json
 import html
 import time
 import requests
+import hashlib
 from playwright.sync_api import sync_playwright
 from deep_translator import GoogleTranslator
 
@@ -11,7 +12,6 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SEEN_FILE = "seen_ids.json"
 UKMTO_URL = "https://www.ukmto.org/recent-incidents"
 
-# Channel Footer
 FOOTER = """🌊 @secretollah
 #حادثه_دریایی
 #مرکز_تجارت_دریایی_بریتانیا"""
@@ -30,7 +30,6 @@ def save_seen_ids(seen_ids):
         json.dump(seen_ids[-100:], f, indent=2)
 
 def translate_to_persian(text, max_retries=3):
-    """Translates summary into Persian with retry logic and error detection."""
     if not text:
         return ""
 
@@ -40,8 +39,6 @@ def translate_to_persian(text, max_retries=3):
     for attempt in range(max_retries):
         try:
             translated = GoogleTranslator(source='auto', target='fa').translate(input_text)
-            
-            # Check if Google returned an error response page instead of a translation
             if translated and any(indicator in translated for indicator in error_indicators):
                 print(f"[DEBUG] Translation attempt {attempt + 1} returned Google Error page text. Retrying...")
                 time.sleep(2)
@@ -57,12 +54,11 @@ def translate_to_persian(text, max_retries=3):
     return input_text
 
 def scrape_ukmto_report_cards():
-    """
-    Finds all UKMTO report cards on the webpage and takes 
-    an element screenshot of each card.
-    """
     reports = []
     
+    # Keywords indicating a UKMTO security report
+    keywords = ["ADVISORY", "WARNING", "ATTACK", "HIJACK", "INCIDENT", "BOARDING", "SUSPICIOUS", "FLASH", "NOTICE", "UPDATE"]
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -72,10 +68,10 @@ def scrape_ukmto_report_cards():
         page = context.new_page()
 
         print(f"Opening UKMTO recent incidents page...")
-        page.goto(UKMTO_URL, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(5000)
+        page.goto(UKMTO_URL, wait_until="networkidle", timeout=60000)
+        page.wait_for_timeout(3000)
 
-        # Accept cookies
+        # Accept cookie banner if present
         try:
             cookie_btn = page.query_selector("button:has-text('Accept'), .cookie-accept")
             if cookie_btn:
@@ -84,46 +80,64 @@ def scrape_ukmto_report_cards():
         except Exception:
             pass
 
-        # Query all elements on page
+        # Scroll page down to force lazy-loaded content to render
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+        page.wait_for_timeout(1500)
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(1500)
+        page.evaluate("window.scrollTo(0, 0)")
+        page.wait_for_timeout(1000)
+
+        # Query potential report elements
         all_elements = page.query_selector_all("div, tr, article, li")
-        
-        found_keys = set()
+        found_signatures = set()
         count = 0
 
         for elem in all_elements:
             try:
                 text = elem.inner_text().strip()
-                
-                # Target UKMTO report card elements
-                if "UKMTO" in text and ("ADVISORY" in text or "WARNING" in text or "ATTACK" in text or "HIJACK" in text):
-                    # Filter for element length of a report card
-                    if 60 < len(text) < 1200:
+                upper_text = text.upper()
+
+                # Check if text mentions UKMTO and any incident keyword
+                if "UKMTO" in upper_text and any(kw in upper_text for kw in keywords):
+                    if 60 < len(text) < 1500:
                         
-                        # Generate unique ID from the report text
-                        first_line = text.split("\n")[0] if "\n" in text else text[:60]
-                        report_key = f"ukmto_{hash(first_line)}"
+                        # Avoid parent container elements that embed multiple sub-elements
+                        sub_matches = elem.query_selector_all("article, div, tr, li")
+                        is_parent_container = False
+                        for sub in sub_matches:
+                            sub_text = sub.inner_text().strip()
+                            if len(sub_text) > 50 and sub_text != text and "UKMTO" in sub_text.upper():
+                                is_parent_container = True
+                                break
                         
-                        if report_key in found_keys:
+                        if is_parent_container:
                             continue
-                        found_keys.add(report_key)
+
+                        # Create a unique SHA256 signature for the report
+                        text_signature = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+                        
+                        if text_signature in found_signatures:
+                            continue
+                        found_signatures.add(text_signature)
 
                         photo_filename = f"card_photo_{count}.png"
                         
-                        # Screenshot the exact report card element on screen
                         try:
                             elem.screenshot(path=photo_filename)
                         except Exception:
                             page.screenshot(path=photo_filename, full_page=False)
 
                         reports.append({
-                            "id": first_line,
+                            "id": text_signature,
+                            "raw_id_display": text.split("\n")[0][:60],
                             "text": text,
                             "photo_path": photo_filename,
                             "link": UKMTO_URL
                         })
                         count += 1
-                        
-                        if count >= 15:
+
+                        if count >= 20:
                             break
 
             except Exception:
@@ -134,7 +148,6 @@ def scrape_ukmto_report_cards():
     return reports
 
 def send_telegram_photo(photo_path, caption):
-    """Sends report photo with Persian translation & spoiler formatting to Telegram."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
     data = {
         "chat_id": CHAT_ID,
@@ -157,27 +170,23 @@ def main():
         print("No report cards found on UKMTO page.")
         return
 
-    print(f"Found {len(reports)} report cards on page!")
+    print(f"Found {len(reports)} valid report cards on page!")
 
-    # Process from oldest to newest
     for item in reversed(reports):
         item_id = item["id"]
+        display_label = item["raw_id_display"]
 
         if item_id in seen_ids:
-            print(f"Skipping previously posted report: {item_id}")
+            print(f"Skipping previously posted report: {display_label} (ID: {item_id})")
             continue
 
         raw_text = item["text"]
         link = item["link"]
         photo_path = item["photo_path"]
 
-        # Clean text formatting
         clean_text = " ".join(raw_text.split())
-
-        # Translate summary to Persian
         persian_translation = translate_to_persian(clean_text)
 
-        # HTML escape
         safe_persian = html.escape(persian_translation[:350])
         safe_original = html.escape(clean_text[:350])
 
@@ -189,11 +198,11 @@ def main():
             f"{FOOTER}"
         )
 
-        print(f"Posting report card photo to Telegram: {item_id}")
+        print(f"Posting report card photo to Telegram: {display_label}")
         success = send_telegram_photo(photo_path, caption)
 
         if success:
-            print("Successfully posted report photo to Telegram!")
+            print(f"Successfully posted report photo to Telegram! (ID: {item_id})")
             seen_ids.append(item_id)
         else:
             print("Failed to post photo to Telegram.")

@@ -2,6 +2,7 @@ import os
 import json
 import html
 import time
+import re
 import requests
 import hashlib
 from playwright.sync_api import sync_playwright
@@ -27,7 +28,20 @@ def load_seen_ids():
 
 def save_seen_ids(seen_ids):
     with open(SEEN_FILE, "w") as f:
-        json.dump(seen_ids[-100:], f, indent=2)
+        json.dump(seen_ids[-150:], f, indent=2)
+
+def extract_official_incident_id(text):
+    """
+    Extracts official UKMTO Incident numbers like '108-26' or '#108' 
+    to create clean, unique tracking IDs.
+    """
+    # Look for patterns like 108-26 or #108
+    match = re.search(r'(?:UKMTO\s*)?(?:ADVISORY|WARNING|ATTACK|HIJACK|SUSPICIOUS)?\s*#?(\d{2,3}(?:-\d{2})?)', text, re.IGNORECASE)
+    if match:
+        return f"ukmto_inc_{match.group(1)}"
+    
+    # Fallback to hash of the raw text
+    return f"ukmto_hash_{hashlib.sha256(text.encode('utf-8')).hexdigest()[:12]}"
 
 def translate_to_persian(text, max_retries=3):
     if not text:
@@ -40,7 +54,7 @@ def translate_to_persian(text, max_retries=3):
         try:
             translated = GoogleTranslator(source='auto', target='fa').translate(input_text)
             if translated and any(indicator in translated for indicator in error_indicators):
-                print(f"[DEBUG] Translation attempt {attempt + 1} returned Google Error page text. Retrying...")
+                print(f"[DEBUG] Translation attempt {attempt + 1} returned Google Error. Retrying...")
                 time.sleep(2)
                 continue
 
@@ -55,7 +69,6 @@ def translate_to_persian(text, max_retries=3):
 
 def scrape_ukmto_report_cards():
     reports = []
-    
     keywords = ["ADVISORY", "WARNING", "ATTACK", "HIJACK", "INCIDENT", "BOARDING", "SUSPICIOUS", "FLASH", "NOTICE", "UPDATE"]
 
     with sync_playwright() as p:
@@ -66,11 +79,11 @@ def scrape_ukmto_report_cards():
         )
         page = context.new_page()
 
-        print(f"Opening UKMTO recent incidents page...")
+        print(f"Connecting to UKMTO recent incidents page...")
         page.goto(UKMTO_URL, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(5000)
+        page.wait_for_timeout(4000)
 
-        # Accept cookies if banner appears
+        # Accept cookies
         try:
             cookie_btn = page.query_selector("button:has-text('Accept'), .cookie-accept")
             if cookie_btn:
@@ -79,16 +92,14 @@ def scrape_ukmto_report_cards():
         except Exception:
             pass
 
-        # Scroll page down and back up to force dynamic cards to render
+        # Scroll to render dynamic elements
         page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-        page.wait_for_timeout(1500)
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(1000)
         page.evaluate("window.scrollTo(0, 0)")
         page.wait_for_timeout(1000)
 
         all_elements = page.query_selector_all("div, tr, article, li")
-        found_signatures = set()
+        found_ids = set()
         count = 0
 
         for elem in all_elements:
@@ -99,7 +110,7 @@ def scrape_ukmto_report_cards():
                 if "UKMTO" in upper_text and any(kw in upper_text for kw in keywords):
                     if 60 < len(text) < 1500:
                         
-                        # Filter out parent containers holding multiple report cards
+                        # Exclude parent containers holding multiple cards
                         sub_matches = elem.query_selector_all("article, div, tr, li")
                         is_parent_container = False
                         for sub in sub_matches:
@@ -111,11 +122,11 @@ def scrape_ukmto_report_cards():
                         if is_parent_container:
                             continue
 
-                        text_signature = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+                        report_id = extract_official_incident_id(text)
                         
-                        if text_signature in found_signatures:
+                        if report_id in found_ids:
                             continue
-                        found_signatures.add(text_signature)
+                        found_ids.add(report_id)
 
                         photo_filename = f"card_photo_{count}.png"
                         
@@ -125,7 +136,7 @@ def scrape_ukmto_report_cards():
                             page.screenshot(path=photo_filename, full_page=False)
 
                         reports.append({
-                            "id": text_signature,
+                            "id": report_id,
                             "raw_id_display": text.split("\n")[0][:60],
                             "text": text,
                             "photo_path": photo_filename,
@@ -133,7 +144,7 @@ def scrape_ukmto_report_cards():
                         })
                         count += 1
 
-                        if count >= 20:
+                        if count >= 25:
                             break
 
             except Exception:
@@ -166,8 +177,9 @@ def main():
         print("No report cards found on UKMTO page.")
         return
 
-    print(f"Found {len(reports)} valid report cards on page!")
+    print(f"Found {len(reports)} report cards on page.")
 
+    # Process reports from oldest to newest so Telegram receives them in order
     for item in reversed(reports):
         item_id = item["id"]
         display_label = item["raw_id_display"]
@@ -192,7 +204,7 @@ def main():
             f"{FOOTER}"
         )
 
-        print(f"Posting report card photo to Telegram: {display_label}")
+        print(f"Posting NEW report to Telegram: {display_label} (ID: {item_id})")
         success = send_telegram_photo(photo_path, caption)
 
         if success:

@@ -38,7 +38,6 @@ def is_today_report(text):
     """
     today_utc = datetime.now(timezone.utc)
     
-    # Date formats to match
     day = today_utc.strftime("%d").lstrip("0")  # e.g. "11" or "1"
     day_padded = today_utc.strftime("%d")       # e.g. "11" or "01"
     month_short = today_utc.strftime("%b")      # e.g. "Aug"
@@ -47,11 +46,10 @@ def is_today_report(text):
     year = today_utc.strftime("%Y")             # e.g. "2026"
     year_short = today_utc.strftime("%y")       # e.g. "26"
 
-    # Patterns to match today's date in UKMTO text
     patterns = [
         rf"\b{day_padded}\s+{month_short}\b",     # 11 Aug
         rf"\b{day}\s+{month_short}\b",            # 11 Aug
-        rf"\b{day_padded}\s+{month_full}\b",    # 11 August
+        rf"\b{day_padded}\s+{month_full}\b",      # 11 August
         rf"\b{day_padded}/{month_num}/{year}\b",  # 11/08/2026
         rf"\b{day_padded}/{month_num}/{year_short}\b" # 11/08/26
     ]
@@ -70,15 +68,15 @@ def extract_official_incident_id(text):
     return f"ukmto_hash_{hashlib.sha256(text.encode('utf-8')).hexdigest()[:12]}"
 
 def translate_to_persian(text, max_retries=3):
+    """Translates the FULL text into Persian with retries."""
     if not text:
         return ""
 
-    input_text = text[:400]
     error_indicators = ["Error 500", "Server Error", "That’s an error", "That's an error"]
 
     for attempt in range(max_retries):
         try:
-            translated = GoogleTranslator(source='auto', target='fa').translate(input_text)
+            translated = GoogleTranslator(source='auto', target='fa').translate(text)
             if translated and any(indicator in translated for indicator in error_indicators):
                 time.sleep(2)
                 continue
@@ -87,7 +85,42 @@ def translate_to_persian(text, max_retries=3):
         except Exception:
             time.sleep(2)
 
-    return input_text
+    return text
+
+def build_telegram_caption(persian_text, original_text):
+    """
+    Constructs a clean Telegram caption with complete Persian translation 
+    and complete original English text, without visual divider lines.
+    Ensures total length stays within Telegram's 1024-character photo caption limit.
+    """
+    safe_persian = html.escape(persian_text)
+    safe_original = html.escape(original_text)
+
+    caption = (
+        f"🚨 <b>گزارش حادثه مرکز تجارت دریایی بریتانیا (UKMTO)</b>\n\n"
+        f"📝 <b>خلاصه گزارش:</b>\n"
+        f"<blockquote>{safe_persian}</blockquote>\n\n"
+        f"🔤 <b>متن اصلی انگلیسی:</b>\n"
+        f"<tg-spoiler>{safe_original}</tg-spoiler>\n\n"
+        f"{FOOTER}"
+    )
+
+    # Dynamic fallback to keep caption under Telegram's strict 1024 character limit
+    if len(caption) > 1024:
+        max_allowed_each = (1024 - 200) // 2
+        safe_persian = safe_persian[:max_allowed_each]
+        safe_original = safe_original[:max_allowed_each]
+
+        caption = (
+            f"🚨 <b>گزارش حادثه مرکز تجارت دریایی بریتانیا (UKMTO)</b>\n\n"
+            f"📝 <b>خلاصه گزارش:</b>\n"
+            f"<blockquote>{safe_persian}</blockquote>\n\n"
+            f"🔤 <b>متن اصلی انگلیسی:</b>\n"
+            f"<tg-spoiler>{safe_original}</tg-spoiler>\n\n"
+            f"{FOOTER}"
+        )
+
+    return caption
 
 def scrape_ukmto_report_cards():
     reports = []
@@ -114,7 +147,7 @@ def scrape_ukmto_report_cards():
         except Exception:
             pass
 
-        # Scroll to render elements
+        # Scroll page to load dynamic content
         page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
         page.wait_for_timeout(1000)
         page.evaluate("window.scrollTo(0, 0)")
@@ -132,7 +165,7 @@ def scrape_ukmto_report_cards():
                 if "UKMTO" in upper_text and any(kw in upper_text for kw in keywords):
                     if 60 < len(text) < 1500:
                         
-                        # Filter out parent containers
+                        # Exclude parent containers holding multiple cards
                         sub_matches = elem.query_selector_all("article, div, tr, li")
                         is_parent = False
                         for sub in sub_matches:
@@ -177,9 +210,7 @@ def scrape_ukmto_report_cards():
     return reports
 
 def send_telegram_photo(photo_path, caption):
-    """
-    Sends photo to Telegram and returns (success_boolean, message_id).
-    """
+    """Sends photo to Telegram and returns (success_boolean, message_id)."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
     data = {
         "chat_id": CHAT_ID,
@@ -196,9 +227,7 @@ def send_telegram_photo(photo_path, caption):
     return False, None
 
 def delete_telegram_message(message_id):
-    """
-    Deletes a message from the Telegram channel using Telegram API deleteMessage.
-    """
+    """Deletes a message from Telegram using deleteMessage API."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage"
     data = {
         "chat_id": CHAT_ID,
@@ -231,32 +260,20 @@ def main():
         # Check if report date matches TODAY's UTC date
         if not is_today_report(raw_text):
             print(f"Skipping older report (not today's date): {display_label}")
-            seen_ids.append(item_id)  # Mark seen so it won't be checked again
+            seen_ids.append(item_id)
             continue
 
         clean_text = " ".join(raw_text.split())
         persian_translation = translate_to_persian(clean_text)
 
-        safe_persian = html.escape(persian_translation)
-        safe_original = html.escape(clean_text)
+        # Build clean caption without lines and with complete text
+        caption = build_telegram_caption(persian_translation, clean_text)
 
-        # Telegram Rich Text HTML Formatting
-        caption = (
-            f"🚨 <b>مرکز تجارت دریایی بریتانیا | UKMTO</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📝 <b>خلاصه گزارش حادثه:</b>\n"
-            f"<blockquote>{safe_persian[:300]}</blockquote>\n\n"
-            f"🔤 <b>متن اصلی انگلیسی (لمس جهت مشاهده):</b>\n"
-            f"<tg-spoiler>{safe_original[:300]}</tg-spoiler>\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"{FOOTER}"
-        )
-
-        print(f"Posting TODAY's report to Telegram: {display_label} (ID: {item_id})")
+        print(f"Posting TODAY's complete report to Telegram: {display_label} (ID: {item_id})")
         success, message_id = send_telegram_photo(photo_path, caption)
 
         if success:
-            # Double-check date post-send; if it failed today's date validation, delete message
+            # Delete if post-send date validation fails
             if not is_today_report(raw_text):
                 print(f"Post-send check failed (not today's date). Deleting message_id: {message_id}")
                 delete_telegram_message(message_id)

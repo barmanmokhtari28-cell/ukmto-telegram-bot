@@ -5,6 +5,7 @@ import time
 import re
 import requests
 import hashlib
+from datetime import datetime, timezone
 from playwright.sync_api import sync_playwright
 from deep_translator import GoogleTranslator
 
@@ -13,9 +14,9 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SEEN_FILE = "seen_ids.json"
 UKMTO_URL = "https://www.ukmto.org/recent-incidents"
 
+# Channel Footer
 FOOTER = """🌊 @secretollah
-#حادثه_دریایی
-#مرکز_تجارت_دریایی_بریتانیا"""
+#حادثه_دریایی #مرکز_تجارت_دریایی_بریتانیا"""
 
 def load_seen_ids():
     if os.path.exists(SEEN_FILE):
@@ -30,17 +31,42 @@ def save_seen_ids(seen_ids):
     with open(SEEN_FILE, "w") as f:
         json.dump(seen_ids[-150:], f, indent=2)
 
+def is_today_report(text):
+    """
+    Checks if the report date in the text matches today's UTC date.
+    Supports formats: '11 Aug 2026', '11 August 2026', '11/08/2026', '11-08-2026'.
+    """
+    today_utc = datetime.now(timezone.utc)
+    
+    # Date formats to match
+    day = today_utc.strftime("%d").lstrip("0")  # e.g. "11" or "1"
+    day_padded = today_utc.strftime("%d")       # e.g. "11" or "01"
+    month_short = today_utc.strftime("%b")      # e.g. "Aug"
+    month_full = today_utc.strftime("%B")       # e.g. "August"
+    month_num = today_utc.strftime("%m")        # e.g. "08"
+    year = today_utc.strftime("%Y")             # e.g. "2026"
+    year_short = today_utc.strftime("%y")       # e.g. "26"
+
+    # Patterns to match today's date in UKMTO text
+    patterns = [
+        rf"\b{day_padded}\s+{month_short}\b",     # 11 Aug
+        rf"\b{day}\s+{month_short}\b",            # 11 Aug
+        rf"\b{day_padded}\s+{month_full}\b",    # 11 August
+        rf"\b{day_padded}/{month_num}/{year}\b",  # 11/08/2026
+        rf"\b{day_padded}/{month_num}/{year_short}\b" # 11/08/26
+    ]
+
+    for pattern in patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            return True
+            
+    return False
+
 def extract_official_incident_id(text):
-    """
-    Extracts official UKMTO Incident numbers like '108-26' or '#108' 
-    to create clean, unique tracking IDs.
-    """
-    # Look for patterns like 108-26 or #108
+    """Extracts official UKMTO Incident numbers like '108-26' or '#108'."""
     match = re.search(r'(?:UKMTO\s*)?(?:ADVISORY|WARNING|ATTACK|HIJACK|SUSPICIOUS)?\s*#?(\d{2,3}(?:-\d{2})?)', text, re.IGNORECASE)
     if match:
         return f"ukmto_inc_{match.group(1)}"
-    
-    # Fallback to hash of the raw text
     return f"ukmto_hash_{hashlib.sha256(text.encode('utf-8')).hexdigest()[:12]}"
 
 def translate_to_persian(text, max_retries=3):
@@ -54,17 +80,13 @@ def translate_to_persian(text, max_retries=3):
         try:
             translated = GoogleTranslator(source='auto', target='fa').translate(input_text)
             if translated and any(indicator in translated for indicator in error_indicators):
-                print(f"[DEBUG] Translation attempt {attempt + 1} returned Google Error. Retrying...")
                 time.sleep(2)
                 continue
-
             if translated:
                 return translated
-        except Exception as e:
-            print(f"[DEBUG] Translation attempt {attempt + 1} error: {e}")
+        except Exception:
             time.sleep(2)
 
-    print("[DEBUG] Translation failed after max retries. Using original text as fallback.")
     return input_text
 
 def scrape_ukmto_report_cards():
@@ -79,7 +101,7 @@ def scrape_ukmto_report_cards():
         )
         page = context.new_page()
 
-        print(f"Connecting to UKMTO recent incidents page...")
+        print("Connecting to UKMTO recent incidents page...")
         page.goto(UKMTO_URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(4000)
 
@@ -92,7 +114,7 @@ def scrape_ukmto_report_cards():
         except Exception:
             pass
 
-        # Scroll to render dynamic elements
+        # Scroll to render elements
         page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
         page.wait_for_timeout(1000)
         page.evaluate("window.scrollTo(0, 0)")
@@ -110,16 +132,16 @@ def scrape_ukmto_report_cards():
                 if "UKMTO" in upper_text and any(kw in upper_text for kw in keywords):
                     if 60 < len(text) < 1500:
                         
-                        # Exclude parent containers holding multiple cards
+                        # Filter out parent containers
                         sub_matches = elem.query_selector_all("article, div, tr, li")
-                        is_parent_container = False
+                        is_parent = False
                         for sub in sub_matches:
                             sub_text = sub.inner_text().strip()
                             if len(sub_text) > 50 and sub_text != text and "UKMTO" in sub_text.upper():
-                                is_parent_container = True
+                                is_parent = True
                                 break
                         
-                        if is_parent_container:
+                        if is_parent:
                             continue
 
                         report_id = extract_official_incident_id(text)
@@ -155,6 +177,9 @@ def scrape_ukmto_report_cards():
     return reports
 
 def send_telegram_photo(photo_path, caption):
+    """
+    Sends photo to Telegram and returns (success_boolean, message_id).
+    """
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
     data = {
         "chat_id": CHAT_ID,
@@ -165,9 +190,22 @@ def send_telegram_photo(photo_path, caption):
     if os.path.exists(photo_path):
         with open(photo_path, "rb") as photo_file:
             files = {"photo": photo_file}
-            res = requests.post(url, data=data, files=files)
-            return res.json().get("ok", False)
-    return False
+            res = requests.post(url, data=data, files=files).json()
+            if res.get("ok"):
+                return True, res["result"]["message_id"]
+    return False, None
+
+def delete_telegram_message(message_id):
+    """
+    Deletes a message from the Telegram channel using Telegram API deleteMessage.
+    """
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage"
+    data = {
+        "chat_id": CHAT_ID,
+        "message_id": message_id
+    }
+    res = requests.post(url, data=data).json()
+    return res.get("ok", False)
 
 def main():
     seen_ids = load_seen_ids()
@@ -179,7 +217,6 @@ def main():
 
     print(f"Found {len(reports)} report cards on page.")
 
-    # Process reports from oldest to newest so Telegram receives them in order
     for item in reversed(reports):
         item_id = item["id"]
         display_label = item["raw_id_display"]
@@ -191,24 +228,41 @@ def main():
         raw_text = item["text"]
         photo_path = item["photo_path"]
 
+        # Check if report date matches TODAY's UTC date
+        if not is_today_report(raw_text):
+            print(f"Skipping older report (not today's date): {display_label}")
+            seen_ids.append(item_id)  # Mark seen so it won't be checked again
+            continue
+
         clean_text = " ".join(raw_text.split())
         persian_translation = translate_to_persian(clean_text)
 
-        safe_persian = html.escape(persian_translation[:350])
-        safe_original = html.escape(clean_text[:350])
+        safe_persian = html.escape(persian_translation)
+        safe_original = html.escape(clean_text)
 
+        # Telegram Rich Text HTML Formatting
         caption = (
-            f"🚨 <b>گزارش حادثه مرکز تجارت دریایی بریتانیا (UKMTO)</b>\n\n"
-            f"{safe_persian}\n\n"
-            f"<tg-spoiler>{safe_original}</tg-spoiler>\n\n"
+            f"🚨 <b>مرکز تجارت دریایی بریتانیا | UKMTO</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📝 <b>خلاصه گزارش حادثه:</b>\n"
+            f"<blockquote>{safe_persian[:300]}</blockquote>\n\n"
+            f"🔤 <b>متن اصلی انگلیسی (لمس جهت مشاهده):</b>\n"
+            f"<tg-spoiler>{safe_original[:300]}</tg-spoiler>\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
             f"{FOOTER}"
         )
 
-        print(f"Posting NEW report to Telegram: {display_label} (ID: {item_id})")
-        success = send_telegram_photo(photo_path, caption)
+        print(f"Posting TODAY's report to Telegram: {display_label} (ID: {item_id})")
+        success, message_id = send_telegram_photo(photo_path, caption)
 
         if success:
-            print(f"Successfully posted report photo to Telegram! (ID: {item_id})")
+            # Double-check date post-send; if it failed today's date validation, delete message
+            if not is_today_report(raw_text):
+                print(f"Post-send check failed (not today's date). Deleting message_id: {message_id}")
+                delete_telegram_message(message_id)
+            else:
+                print(f"Successfully posted report photo to Telegram! (Message ID: {message_id})")
+            
             seen_ids.append(item_id)
         else:
             print("Failed to post photo to Telegram.")

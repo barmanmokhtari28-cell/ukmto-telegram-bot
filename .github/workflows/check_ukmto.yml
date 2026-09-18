@@ -1,13 +1,13 @@
 name: UKMTO Advisory Telegram Bot
 
 on:
-  schedule:
-    - cron: '*/10 * * * *'  # Runs every 10 minutes
-  workflow_dispatch:
+  workflow_dispatch:  # Allows manual runs and external triggers via API
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Crucial: allows committing seen_ids.json back to repo
 
     steps:
       - name: Checkout Repository
